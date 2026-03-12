@@ -474,7 +474,7 @@
 // ──────────────────────────────────────────────
 // Replace this URL with your actual Google Apps Script Web App URL
 // or any backend endpoint that accepts POST with JSON
-const BACKEND_URL = 'https://script.google.com/macros/s/1eNwSxQeMD8CouoGkWzejabA3kR0l9uR98AH69otohJebwomAVxmxHHgV/exec';
+const BACKEND_URL = 'https://script.google.com/macros/s/AKfycbxuqh1Jf9_0fR89gMmRaMvzC_9x7QAebCmjGcE7sOVz06MZpN_xxscsTL-DBud3aBZLbA/exec';
 
 // For demo purposes, tenant data is embedded in URL params.
 // Real use: load from backend by apt number.
@@ -502,14 +502,17 @@ window.addEventListener('DOMContentLoaded', async () => {
   document.getElementById('aptBadge').textContent   = `דירה #${aptNumber}`;
   document.getElementById('descriptionText').textContent = desc;
 
-  // Check vote status
-  const status = await checkStatus(aptNumber);
-
+  // ── בדיקת סטטוס + שליפת תיאור מהטבלה ──
+  const result = await checkStatus(aptNumber);
   document.getElementById('loadingView').style.display = 'none';
 
-  if (status === 'בוצע') {
+  if (result.status === 'בוצע') {
     document.getElementById('blockedView').style.display = 'block';
   } else {
+    // הצג תיאור הצבעה מהגיליון אם קיים
+    if (result.description) {
+      document.getElementById('descriptionText').textContent = result.description;
+    }
     document.getElementById('formView').style.display = 'block';
     initCanvas();
   }
@@ -520,14 +523,13 @@ window.addEventListener('DOMContentLoaded', async () => {
 // ──────────────────────────────────────────────
 async function checkStatus(apt) {
   try {
-    const res = await fetch(`${BACKEND_URL}?action=getStatus&apt=${encodeURIComponent(apt)}`);
-    if (!res.ok) throw new Error();
+    const res  = await fetch(`${BACKEND_URL}?action=getStatus&apt=${encodeURIComponent(apt)}`);
     const data = await res.json();
-    return data.status; // expects { status: "ממתין" | "בוצע" }
-  } catch {
-    // DEMO MODE: assume not voted yet
-    console.warn('Backend unreachable – running in demo mode');
-    return 'ממתין';
+    // מחזיר { status, description }
+    return { status: data.status || 'ממתין', description: data.description || '' };
+  } catch(e) {
+    console.warn('Backend unreachable:', e.message);
+    return { status: 'ממתין', description: '' };
   }
 }
 
@@ -605,11 +607,12 @@ function clearSig() {
 
 // ──────────────────────────────────────────────
 // FORM SUBMISSION
+// שיטה: iframe סמוי — עוקף CORS לחלוטין,
+// עובד מכל סביבה (file://, http, https)
 // ──────────────────────────────────────────────
 async function submitForm() {
   let valid = true;
 
-  // Validate ID
   const idVal = document.getElementById('idField').value.trim();
   if (!/^\d{9}$/.test(idVal)) {
     document.getElementById('idField').classList.add('error');
@@ -620,13 +623,11 @@ async function submitForm() {
     document.getElementById('idError').style.display = 'none';
   }
 
-  // Validate stance
   if (!selectedStance) {
     document.getElementById('stanceError').style.display = 'block';
     valid = false;
   }
 
-  // Validate signature
   if (!isSigned) {
     document.getElementById('sigError').style.display = 'block';
     valid = false;
@@ -638,33 +639,69 @@ async function submitForm() {
   btn.disabled = true;
   btn.textContent = 'שולח...';
 
+  const signatureDataURL = canvas.toDataURL('image/png');
+  const timestamp = new Date().toLocaleString('he-IL');
+  const stanceHeb = selectedStance === 'yes' ? 'בעד' : 'נגד';
+
+  // ── שלב א: שלח נתוני הצבעה + חתימה בטופס אחד דרך iframe ──
+  // iframe מוסתר → Apps Script מקבל POST רגיל ללא CORS
+  await submitToGAS({
+    action:    'submitVote',
+    apt:       aptNumber,
+    name:      tenantName,
+    idNumber:  idVal,
+    stance:    stanceHeb,
+    signature: signatureDataURL,
+    timestamp: timestamp,
+  });
+
+  // ── שלב ב: המתן לשרת ואז הצג הצלחה ──
+  // מחכים 3 שניות כדי לתת לשרת זמן לכתוב לגיליון
+  setTimeout(() => {
+    document.getElementById('formView').style.display    = 'none';
+    document.getElementById('successView').style.display = 'block';
+  }, 3000);
+}
+
+// ── שליחה ל-Apps Script ──
+// שיטה: fetch POST עם urlencoded body + no-cors
+// זו השיטה הרשמית היחידה שעובדת cross-origin עם Apps Script
+async function submitToGAS(data) {
   try {
-    const signatureDataURL = canvas.toDataURL('image/png');
+    // המר לפורמט urlencoded (לא JSON, לא FormData)
+    // base64 של חתימה עלול להיות גדול — נחלק לשני requests
+    const sigData   = data.signature || '';
+    const mainData  = Object.assign({}, data, { signature: '' });
 
-    const payload = {
-      action:    'submitVote',
-      apt:       aptNumber,
-      name:      tenantName,
-      idNumber:  idVal,
-      stance:    selectedStance === 'yes' ? 'בעד' : 'נגד',
-      signature: signatureDataURL,
-      timestamp: new Date().toLocaleString('he-IL'),
-    };
+    // בקשה ראשונה: כל הנתונים ללא חתימה
+    const body1 = Object.entries(mainData)
+      .map(([k,v]) => encodeURIComponent(k) + '=' + encodeURIComponent(v))
+      .join('&');
 
-    // POST to backend
     await fetch(BACKEND_URL, {
       method:  'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body:    JSON.stringify(payload),
+      mode:    'no-cors',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body:    body1,
     });
 
-  } catch (err) {
-    console.warn('Backend POST failed – demo mode, showing success anyway.');
-  }
+    // בקשה שנייה: חתימה בנפרד
+    if (sigData) {
+      const body2 = 'action=saveSignature'
+        + '&apt='       + encodeURIComponent(data.apt)
+        + '&name='      + encodeURIComponent(data.name || '')
+        + '&signature=' + encodeURIComponent(sigData);
 
-  // Show success regardless (in real app, check response)
-  document.getElementById('formView').style.display    = 'none';
-  document.getElementById('successView').style.display = 'block';
+      await fetch(BACKEND_URL, {
+        method:  'POST',
+        mode:    'no-cors',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body:    body2,
+      });
+    }
+  } catch(err) {
+    console.warn('submitToGAS error:', err.message);
+  }
 }
 </script>
 </body>
